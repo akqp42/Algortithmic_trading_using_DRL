@@ -1,0 +1,99 @@
+import gym_trading_env
+import gymnasium as gym
+import pandas as pd
+import numpy as np
+
+
+
+#positins -2 to 2
+#trading fees 0
+# borrow interest rate 0
+#portfolio initial value 100000
+# initial position 0
+#max episode duration 390 mins ( depploy - max)
+#verbose-1
+#name AAPL
+#reward function
+def reward_function(history):
+    brokerage_percent = 0.0003
+    brokerage_fixed = 1
+    prev_value = history["portfolio_valuation", -2]
+    curr_value = history["portfolio_valuation", -1]
+    profit = curr_value - prev_value
+    threshold_percentage = prev_value * brokerage_percent
+    threshold_fixed = prev_value + brokerage_fixed
+    if threshold_percentage < threshold_fixed:
+        if profit > threshold_percentage:
+            return np.log(1 + profit)
+    else:
+        if profit > threshold_fixed:
+            return np.log(1 + profit)
+    return 0
+
+
+
+    data = pd.read_csv(r'C:\Users\ayush\OneDrive\Documents\Desktop\tradebot\features.csv')
+df = pd.DataFrame(data)
+df1 = pd.DataFrame()
+df1[['timestamp', 'open', 'high', 'low', 'close', 'volume']] = df[['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']]
+
+df1["feature_close"] = df1["close"].pct_change()
+
+# Create the feature : open[t] / close[t]
+df1["feature_open"] = df1["open"]/df1["close"]
+
+# Create the feature : high[t] / close[t]
+df1["feature_high"] = df1["high"]/df1["close"]
+
+# Create the feature : low[t] / close[t]
+df1["feature_low"] = df1["low"]/df1["close"]
+
+df1["feature_volume"] = df1["volume"] / df1["volume"].rolling(7*24*60).max()
+
+df1.dropna(inplace= True)
+df1.head()
+
+
+
+
+df1['feature_volatility'] = df['Volatility_signal']
+df1['feature_HA'] = df['Heiken_Ashi']
+df1['feature_MACD'] = df['MACD_Signal']
+df1['feature_SMA'] = df['SMA_Signal']
+df1['feature_BB'] = df['BB_Signal']
+df1['feature_MFI'] = df['MFI_Signal']
+df1['feature_WMA'] = df['WMA_Signal']
+
+df1.head()
+
+
+
+posi = []
+posi = np.linspace(-1,1, num=200).tolist()
+if 0 not in posi:
+    posi.append(0)
+
+
+
+env = gym.make('TradingEnv', df = df1, 
+               reward_function = reward_function,
+               trading_fees = 0,
+               borrow_interest_rate = 0,
+               portfolio_initial_value = 100000,
+               initial_position = 0,
+               max_episode_duration = 'max',
+               verbose = 1,
+               name = 'AAPL'
+               )
+
+
+
+
+
+# Run an episode until it ends :
+done, truncated = False, False
+observation, info = env.reset()
+while not done and not truncated:
+    # Pick a position by its index in your position list (=[-1, 0, 1])....usually something like : position_index = your_policy(observation)
+    position_index = env.action_space.sample() # At every timestep, pick a random position index from your position list (=[-1, 0, 1])
+    observation, reward, done, truncated, info = env.step(position_index)
