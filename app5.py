@@ -8,12 +8,18 @@ import sys
 import os
 import json
 import time
-
-# Import your custom environment
-from trading_env import TradingEnv
+import requests
 
 app = Flask(__name__)
 CORS(app)
+
+# =============================================================================
+# REMOTE API CONFIGURATION
+# =============================================================================
+
+# Your Render API URL (update this after deployment)
+TRADING_API_URL = os.getenv('TRADING_API_URL', 'http://localhost:8000')
+API_KEY = os.getenv('TRADING_API_KEY', None)  # Optional: if you add authentication
 
 # Global variables
 T_indicators = ['HA_signal', 'MACD_signal', 'MA_signal', 'OBV_signal']
@@ -24,25 +30,121 @@ continuous_features = [
     'Taker Buy Quote', 'Taker Buy Base', 'Number of Trades', 'Quote Asset Volume'
 ]
 
+
+# =============================================================================
+# REMOTE API CLIENT
+# =============================================================================
+
+class RemoteTradingAPIClient:
+    """Client for interacting with the remote Trading Environment API"""
+    
+    def __init__(self, base_url, api_key=None):
+        self.base_url = base_url.rstrip('/')
+        self.headers = {'Content-Type': 'application/json'}
+        if api_key:
+            self.headers['X-API-Key'] = api_key
+    
+    def health_check(self):
+        """Check if remote API is running"""
+        try:
+            response = requests.get(f"{self.base_url}/health", timeout=5)
+            return response.status_code == 200
+        except:
+            return False
+    
+    def create_environment(self, csv_file_path, initial_balance=10000):
+        """Create a new trading environment on remote server"""
+        config = {
+            "T_indicators": T_indicators,
+            "MR_indicators": MR_indicators,
+            "continuous_features": continuous_features,
+            "initial_balance": initial_balance
+        }
+        
+        with open(csv_file_path, 'rb') as f:
+            files = {'file': f}
+            data = {'config': json.dumps(config)}
+            response = requests.post(
+                f"{self.base_url}/create_environment",
+                files=files,
+                data=data,
+                headers={'X-API-Key': self.headers.get('X-API-Key', '')} if 'X-API-Key' in self.headers else {}
+            )
+        
+        response.raise_for_status()
+        result = response.json()
+        return result['env_id']
+    
+    def reset_environment(self, env_id, seed=None):
+        """Reset environment to initial state"""
+        payload = {"env_id": env_id}
+        if seed is not None:
+            payload["seed"] = seed
+        
+        response = requests.post(
+            f"{self.base_url}/reset",
+            json=payload,
+            headers=self.headers
+        )
+        response.raise_for_status()
+        return response.json()
+    
+    def step(self, env_id, action):
+        """Execute one step in the environment"""
+        payload = {
+            "env_id": env_id,
+            "action": action
+        }
+        
+        response = requests.post(
+            f"{self.base_url}/step",
+            json=payload,
+            headers=self.headers
+        )
+        response.raise_for_status()
+        return response.json()
+    
+    def get_environment_info(self, env_id):
+        """Get detailed information about an environment"""
+        response = requests.get(
+            f"{self.base_url}/environment/{env_id}/info",
+            headers=self.headers
+        )
+        response.raise_for_status()
+        return response.json()
+    
+    def get_positions(self, env_id):
+        """Get current positions in the environment"""
+        response = requests.post(
+            f"{self.base_url}/environment/{env_id}/positions",
+            headers=self.headers
+        )
+        response.raise_for_status()
+        return response.json()
+    
+    def delete_environment(self, env_id):
+        """Delete an environment"""
+        response = requests.delete(
+            f"{self.base_url}/environment/{env_id}",
+            headers=self.headers
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+# =============================================================================
+# TRADING ANALYZER
+# =============================================================================
+
 class TradingAnalyzer:
-    """Collects info dicts from all steps and calculates metrics at the end"""
+    """Collects trading data and calculates metrics"""
     
     def __init__(self, initial_balance=10000):
         self.initial_balance = initial_balance
-        
-        # Store all info dicts and metadata
-        self.history = []  # List of tuples: (step, timestamp, info, reward)
-        
+        self.history = []
+    
     def record_step(self, step, timestamp, info, reward):
-        """
-        Record info dict from each step
-        
-        Args:
-            step: Current step number
-            timestamp: Current timestamp
-            info: Complete info dict from environment
-            reward: Reward from this step
-        """
+        """Record step data"""
         self.history.append({
             'step': step,
             'timestamp': timestamp,
@@ -51,20 +153,16 @@ class TradingAnalyzer:
         })
     
     def extract_trades_from_history(self):
-        """
-        Extract all completed trades from the stored history
-        """
+        """Extract completed trades from history"""
         trades = []
         
         for record in self.history:
             info = record['info']
             timestamp = record['timestamp']
             
-            # Check if this step had position changes
             if info and 'position_changes' in info and info['position_changes']:
                 position_changes = info['position_changes']
                 
-                # Extract closed positions (completed trades)
                 if 'closed' in position_changes and position_changes['closed']:
                     for closed_pos in position_changes['closed']:
                         trade = {
@@ -84,118 +182,51 @@ class TradingAnalyzer:
         return trades
     
     def save_trades_to_csv(self, trades, save_dir='backtest_results'):
-        """Save all trades to a CSV file with detailed information"""
+        """Save trades to CSV"""
         if not trades:
-            print("⚠ No trades to save")
             return None
         
         os.makedirs(save_dir, exist_ok=True)
-        
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         filename = os.path.join(save_dir, f'trades_{timestamp}.csv')
         
         try:
-            # Convert trades list to DataFrame
             trades_df = pd.DataFrame(trades)
-            
-            # Add trade number column at the beginning
             trades_df.insert(0, 'trade_number', range(1, len(trades_df) + 1))
-            
-            # Add win/loss indicator
             trades_df['win_loss'] = trades_df['pnl'].apply(
                 lambda x: 'WIN' if x > 0 else 'LOSS' if x < 0 else 'BREAKEVEN'
             )
             
-            # Reorder columns for better readability
-            column_order = [
-                'trade_number',
-                'timestamp',
-                'step',
-                'entry_price',
-                'exit_price',
-                'quantity',
-                'pnl',
-                'pnl_percent',
-                'win_loss',
-                'holding_period',
-                'close_reason',
-                'portfolio_value'
-            ]
-            
-            # Only include columns that exist
-            existing_columns = [col for col in column_order if col in trades_df.columns]
-            trades_df = trades_df[existing_columns]
-            
-            # Round numeric columns for better readability
-            numeric_rounds = {
-                'entry_price': 4,
-                'exit_price': 4,
-                'quantity': 6,
-                'pnl': 2,
-                'pnl_percent': 2,
-                'portfolio_value': 2
-            }
-            
-            for col, decimals in numeric_rounds.items():
-                if col in trades_df.columns:
-                    trades_df[col] = trades_df[col].round(decimals)
-            
-            # Save to CSV
             trades_df.to_csv(filename, index=False)
-            
             print(f"✓ Trades saved to: {filename}")
-            print(f"✓ Total trades exported: {len(trades_df)}")
-            
             return filename
-            
         except Exception as e:
-            print(f"❌ Error saving trades to CSV: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            print(f"❌ Error saving trades: {str(e)}")
             return None
     
     def calculate_metrics(self):
-        """Calculate all trading metrics from the complete history"""
-        
-        # Extract portfolio values from history
+        """Calculate trading metrics"""
         portfolio_values = [h['info']['portfolio_value'] for h in self.history if h['info']]
         
-        # Portfolio metrics
         final_value = portfolio_values[-1] if portfolio_values else self.initial_balance
         total_return = final_value - self.initial_balance
         total_return_pct = (total_return / self.initial_balance) * 100
         
-        # Extract trades
         trades = self.extract_trades_from_history()
-        
-        # Trade statistics
         num_trades = len(trades)
         winning_trades = [t for t in trades if t['pnl'] > 0]
         losing_trades = [t for t in trades if t['pnl'] < 0]
         
-        # Win rate
         win_rate = (len(winning_trades) / num_trades * 100) if num_trades > 0 else 0.0
-        
-        # PnL calculations
         total_pnl = sum(t['pnl'] for t in trades) if trades else 0.0
         avg_win = np.mean([t['pnl'] for t in winning_trades]) if winning_trades else 0.0
         avg_loss = np.mean([t['pnl'] for t in losing_trades]) if losing_trades else 0.0
         
-        # Profit factor
         total_wins = sum(t['pnl'] for t in winning_trades) if winning_trades else 0.0
         total_losses = abs(sum(t['pnl'] for t in losing_trades)) if losing_trades else 0.0
         profit_factor = (total_wins / total_losses) if total_losses > 0 else 0.0
         
-        # Expectancy
         expectancy = (win_rate/100 * avg_win) + ((1 - win_rate/100) * avg_loss)
-        
-        # Close reason breakdown
-        close_reasons = {}
-        for trade in trades:
-            reason = trade.get('close_reason', 'unknown')
-            close_reasons[reason] = close_reasons.get(reason, 0) + 1
-        
-        # Calculate total reward
         total_reward = sum(h['reward'] for h in self.history)
         
         metrics = {
@@ -213,75 +244,15 @@ class TradingAnalyzer:
             'Profit Factor': f'{profit_factor:.3f}',
             'Expectancy': f'${expectancy:.2f}',
             'Total Steps': f'{len(self.history):,}',
-            'Total Reward': f'{total_reward:.2f}',
-            'Close Reasons': close_reasons
+            'Total Reward': f'{total_reward:.2f}'
         }
         
         return metrics, trades
-    
-    def save_metrics_to_file(self, metrics, trades, save_dir='backtest_results'):
-        """Save all metrics to a text file"""
-        os.makedirs(save_dir, exist_ok=True)
-        
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = os.path.join(save_dir, f'trading_metrics_{timestamp}.txt')
-        
-        with open(filename, 'w') as f:
-            f.write("=" * 80 + "\n")
-            f.write("TRADING PERFORMANCE METRICS\n")
-            f.write("=" * 80 + "\n")
-            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("=" * 80 + "\n\n")
-            
-            f.write("PORTFOLIO SUMMARY\n")
-            f.write("-" * 80 + "\n")
-            for key in ['Initial Balance', 'Final Balance', 'Total Return', 'Total Return (%)']:
-                f.write(f"{key:.<40} {metrics[key]:>20}\n")
-            f.write("\n")
-            
-            f.write("TRADE STATISTICS\n")
-            f.write("-" * 80 + "\n")
-            for key in ['Total Trades', 'Winning Trades', 'Losing Trades', 'Win Rate', 
-                       'Total PnL', 'Avg Win', 'Avg Loss', 'Profit Factor', 'Expectancy']:
-                f.write(f"{key:.<40} {metrics[key]:>20}\n")
-            f.write("\n")
-            
-            f.write("EXECUTION DETAILS\n")
-            f.write("-" * 80 + "\n")
-            f.write(f"{'Total Steps':.<40} {metrics['Total Steps']:>20}\n")
-            f.write(f"{'Total Reward':.<40} {metrics['Total Reward']:>20}\n")
-            f.write("\n")
-            
-            # Close reasons breakdown
-            if 'Close Reasons' in metrics and metrics['Close Reasons']:
-                f.write("POSITION CLOSE REASONS\n")
-                f.write("-" * 80 + "\n")
-                for reason, count in metrics['Close Reasons'].items():
-                    f.write(f"{reason:.<40} {count:>20}\n")
-                f.write("\n")
-            
-            # Write detailed trade log
-            if trades:
-                f.write("\n" + "=" * 80 + "\n")
-                f.write("DETAILED TRADE LOG\n")
-                f.write("=" * 80 + "\n\n")
-                
-                for i, trade in enumerate(trades, 1):
-                    f.write(f"Trade #{i}\n")
-                    f.write(f"  Timestamp: {trade['timestamp']}\n")
-                    f.write(f"  Step: {trade['step']}\n")
-                    f.write(f"  Entry Price: ${trade['entry_price']:.4f}\n")
-                    f.write(f"  Exit Price: ${trade['exit_price']:.4f}\n")
-                    f.write(f"  Quantity: {trade['quantity']:.4f}\n")
-                    f.write(f"  PnL: ${trade['pnl']:.2f} ({trade['pnl_percent']:.2f}%)\n")
-                    f.write(f"  Holding Period: {trade['holding_period']} steps\n")
-                    f.write(f"  Close Reason: {trade['close_reason']}\n")
-                    f.write(f"  Portfolio Value: ${trade['portfolio_value']:.2f}\n")
-                    f.write("-" * 40 + "\n")
-        
-        print(f"✓ Metrics saved to: {filename}")
-        return filename
 
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
 
 def live_indicators(csv_path):
     """Load and process the CSV file with technical indicators"""
@@ -290,6 +261,31 @@ def live_indicators(csv_path):
     ti = TechnicalIndicators()
     df = ti.calculate_from_csv(csv_path)
     return df
+
+
+def save_filtered_csv(df, save_path='temp_backtest_data.csv'):
+    """Save filtered dataframe temporarily for API upload"""
+    df.to_csv(save_path, index=False)
+    return save_path
+
+
+# =============================================================================
+# FLASK ROUTES
+# =============================================================================
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    # Also check if remote API is available
+    client = RemoteTradingAPIClient(TRADING_API_URL, API_KEY)
+    remote_status = client.health_check()
+    
+    return jsonify({
+        'status': 'ok', 
+        'message': 'Flask backend is running',
+        'remote_api_status': 'connected' if remote_status else 'disconnected',
+        'remote_api_url': TRADING_API_URL
+    })
 
 
 @app.route('/api/cryptocurrencies', methods=['GET'])
@@ -335,9 +331,12 @@ def get_timerange():
 
 @app.route('/api/backtest/stream', methods=['POST'])
 def run_backtest_stream():
-    """Run backtest with streaming updates, calculate metrics at the end"""
+    """Run backtest using REMOTE API with streaming updates"""
     def generate():
+        client = RemoteTradingAPIClient(TRADING_API_URL, API_KEY)
+        env_id = None
         analyzer = None
+        
         try:
             data = request.json
             crypto = data.get('crypto')
@@ -348,8 +347,17 @@ def run_backtest_stream():
                 yield f"data: {json.dumps({'type': 'error', 'message': 'Missing required parameters'})}\n\n"
                 return
             
+            # Check remote API connection
+            yield f"data: {json.dumps({'type': 'info', 'message': 'Checking remote API connection...'})}\n\n"
+            
+            if not client.health_check():
+                yield f"data: {json.dumps({'type': 'error', 'message': f'Cannot connect to remote API at {TRADING_API_URL}'})}\n\n"
+                return
+            
+            yield f"data: {json.dumps({'type': 'info', 'message': f'Connected to remote API: {TRADING_API_URL}'})}\n\n"
             yield f"data: {json.dumps({'type': 'info', 'message': 'Loading data...'})}\n\n"
             
+            # Load and filter data
             df = live_indicators('best_cluster_similar_price.csv')
             df.dropna(inplace=True)
             df_crypto = df[df['cryptocoin'] == crypto].copy()
@@ -378,37 +386,51 @@ def run_backtest_stream():
             
             yield f"data: {json.dumps({'type': 'init', 'message': 'Initializing backtest...', 'total_steps': total_steps})}\n\n"
             
+            # Save filtered data temporarily
+            temp_csv = save_filtered_csv(df_test)
+            
+            # Create environment on remote server
+            yield f"data: {json.dumps({'type': 'info', 'message': 'Creating remote trading environment...'})}\n\n"
+            
             initial_balance = 10000
-            test_env = TradingEnv(
-                df_test, 
-                T_indicators, 
-                MR_indicators, 
-                continuous_features, 
-                initial_balance=initial_balance
-            )
+            env_id = client.create_environment(temp_csv, initial_balance=initial_balance)
+            
+            yield f"data: {json.dumps({'type': 'info', 'message': f'Environment created: {env_id[:8]}...'})}\n\n"
             
             # Initialize analyzer
             analyzer = TradingAnalyzer(initial_balance=initial_balance)
             
+            # Reset environment
+            yield f"data: {json.dumps({'type': 'info', 'message': 'Resetting environment...'})}\n\n"
+            reset_result = client.reset_environment(env_id)
+            obs = reset_result['observation']
+            
+            # Load model
             yield f"data: {json.dumps({'type': 'info', 'message': 'Loading AI model...'})}\n\n"
             model = PPO.load("ppo_trading_bot_enhanced.zip")
             
             yield f"data: {json.dumps({'type': 'info', 'message': 'Starting backtest...'})}\n\n"
             
-            obs, info = test_env.reset()
             done = False
             step_count = 0
             
-            # Run the backtest and collect all info dicts
+            # Run backtest using remote API
             while not done and step_count < total_steps:
-                # Take action
-                action, _ = model.predict(obs, deterministic=False)
-                obs, reward, done, truncated, info = test_env.step(action)
+                # Predict action locally
+                action, _ = model.predict(np.array(obs), deterministic=False)
+                
+                # Send action to remote environment
+                step_result = client.step(env_id, action.tolist())
+                
+                obs = step_result['observation']
+                reward = step_result['reward']
+                done = step_result['terminated'] or step_result['truncated']
+                info = step_result['info']
                 
                 # Get current timestamp
                 current_timestamp = df_test.iloc[min(step_count, len(df_test) - 1)]['Open Time'].strftime('%Y-%m-%d %H:%M:%S')
                 
-                # Record step in analyzer (just store the info dict)
+                # Record step
                 analyzer.record_step(
                     step=step_count,
                     timestamp=current_timestamp,
@@ -418,12 +440,11 @@ def run_backtest_stream():
                 
                 step_count += 1
                 
-                # Calculate current metrics for streaming
-                current_value = info['portfolio_value']
-                current_pnl = current_value - initial_balance
-                
-                # Stream step data every 10 steps to reduce overhead
+                # Stream progress every 10 steps
                 if step_count % 10 == 0:
+                    current_value = info['portfolio_value']
+                    current_pnl = current_value - initial_balance
+                    
                     step_data = {
                         'type': 'step',
                         'step': step_count,
@@ -436,43 +457,16 @@ def run_backtest_stream():
                     }
                     yield f"data: {json.dumps(step_data)}\n\n"
             
-            # NOW calculate all metrics from the complete history
-            yield f"data: {json.dumps({'type': 'info', 'message': 'Calculating metrics from complete history...'})}\n\n"
-            
-            print(f"\n{'='*80}")
-            print(f"Processing complete history of {len(analyzer.history)} steps...")
-            print(f"{'='*80}\n")
+            # Calculate metrics
+            yield f"data: {json.dumps({'type': 'info', 'message': 'Calculating metrics...'})}\n\n"
             
             final_metrics, trades = analyzer.calculate_metrics()
-            
-            print(f"\n{'='*80}")
-            print(f"Metrics calculated:")
-            for key, value in final_metrics.items():
-                if key != 'Close Reasons':
-                    print(f"  {key}: {value}")
-            print(f"Total trades found: {len(trades)}")
-            print(f"{'='*80}\n")
             
             # Save trades to CSV
             trades_csv_file = None
             if len(trades) > 0:
                 yield f"data: {json.dumps({'type': 'info', 'message': f'Saving {len(trades)} trades to CSV...'})}\n\n"
-                
                 trades_csv_file = analyzer.save_trades_to_csv(trades)
-                
-                if trades_csv_file:
-                    yield f"data: {json.dumps({'type': 'info', 'message': f'Trades CSV saved to: {trades_csv_file}'})}\n\n"
-                else:
-                    yield f"data: {json.dumps({'type': 'warning', 'message': 'Failed to save trades CSV'})}\n\n"
-            else:
-                yield f"data: {json.dumps({'type': 'info', 'message': 'No trades to save to CSV (0 trades executed)'})}\n\n"
-            
-            # Save metrics to text file
-            yield f"data: {json.dumps({'type': 'info', 'message': 'Saving metrics to file...'})}\n\n"
-            
-            metrics_file = analyzer.save_metrics_to_file(final_metrics, trades)
-            
-            yield f"data: {json.dumps({'type': 'info', 'message': f'Metrics saved to: {metrics_file}'})}\n\n"
             
             # Prepare completion data
             final_value = analyzer.history[-1]['info']['portfolio_value'] if analyzer.history else initial_balance
@@ -493,16 +487,32 @@ def run_backtest_stream():
                     'total_reward': round(total_reward, 2),
                     'num_trades': len(trades),
                     'win_rate': round((len([t for t in trades if t['pnl'] > 0]) / len(trades) * 100) if trades else 0, 2),
-                    'metrics_saved': metrics_file,
-                    'trades_csv_saved': trades_csv_file
+                    'trades_csv_saved': trades_csv_file,
+                    'env_id': env_id
                 }
             }
             yield f"data: {json.dumps(completion_data)}\n\n"
+            
+            # Cleanup
+            if os.path.exists(temp_csv):
+                os.remove(temp_csv)
+            
+            # Delete remote environment
+            yield f"data: {json.dumps({'type': 'info', 'message': 'Cleaning up remote environment...'})}\n\n"
+            client.delete_environment(env_id)
         
         except Exception as e:
             import traceback
             error_trace = traceback.format_exc()
             print(error_trace)
+            
+            # Cleanup on error
+            if env_id:
+                try:
+                    client.delete_environment(env_id)
+                except:
+                    pass
+            
             error_data = {
                 'type': 'error',
                 'message': str(e),
@@ -521,11 +531,12 @@ def run_backtest_stream():
     )
 
 
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({'status': 'ok', 'message': 'Flask backend is running'})
-
-
 if __name__ == '__main__':
+    # Check environment variables
+    print(f"Trading API URL: {TRADING_API_URL}")
+    if API_KEY:
+        print(f"API Key configured: Yes")
+    else:
+        print(f"API Key configured: No (optional)")
+    
     app.run(debug=True, host='0.0.0.0', port=5000)
